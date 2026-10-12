@@ -1,190 +1,142 @@
-# High-Performance Wavelet Convolution (WTConv)
+# WTConv-CUDA: Fused CUDA Kernels for Wavelet Convolutions
 
-This repository contains a highly optimized implementation of the **Wavelet Convolution (WTConv)** layer, accelerating the original PyTorch implementation using custom **C++** and **CUDA** kernels.
+Custom C++/CUDA kernels for the WTConv layer: the same outputs and gradients as the PyTorch reference, with up to **~10x lower inference latency** and **~2.4x higher training throughput** in a full ResNet-18 pipeline.
 
-The project moves the computationally heavy operations from standard PyTorch layers to custom JIT-compiled extensions that utilize **Kernel Fusion**, **Shared Memory tiling**, and **Parallel Reduction**, achieving significant speedups over the reference implementation.
+## Background
 
-Based on the article "Wavelet Convolutions for Large Receptive Fields" by Shahaf E. Finder, Roy Amoyal, Eran Treister, Oren Freifeld: 
-https://arxiv.org/abs/2407.05848
+**WTConv** ([Finder et al., *Wavelet Convolutions for Large Receptive Fields*, ECCV 2024](https://arxiv.org/abs/2407.05848)) gives a CNN a large receptive field cheaply. It applies a Haar wavelet transform (DWT), runs a small depthwise convolution on each frequency sub-band, and recombines the results with the inverse transform (IDWT). Repeating this over several wavelet levels grows the receptive field, while the parameter count only grows logarithmically.
 
-And on BGU-CS-VIL/WTConv git repo as reference to speedup: 
-https://github.com/BGU-CS-VIL/WTConv
+The [official implementation](https://github.com/BGU-CS-VIL/WTConv) (vendored here under `Reference/`, MIT license) builds the layer from a chain of standard PyTorch ops. Each step launches its own kernel and writes intermediate tensors to global memory, so the layer is much slower than a plain convolution with the same FLOP count.
 
-## 🚀 Features
+## What this project adds
 
-* **Reference Implementation:** A pure PyTorch implementation (based on `BGU-CS-VIL/WTConv`) for correctness verification.
-* **C++ (CPU) Extension:** OpenMP-parallelized implementation for efficient CPU execution.
-* **Baseline CUDA:** A direct port of the algorithm to CUDA.
-* **Optimized CUDA (Fused):** A highly optimized kernel that fuses the Discrete Wavelet Transform (DWT), Convolution, and Inverse DWT (IDWT) into single kernels to minimize global memory access.
-    * **Forward Pass:** ~8.7x faster than PyTorch.
-    * **Backward Pass:** ~4.5x faster than PyTorch.
-* **Optimized V2 (Experimental):** An alternative approach.
+Four drop-in replacements for `WTConv2d`, each with a hand-written forward **and backward** pass:
 
-## 📂 Repository Structure
+| Implementation | Directory | Key ideas |
+|---|---|---|
+| C++ (CPU) | `cpp_source/` | OpenMP-parallel reference port (forward/backward) |
+| `cuda` | `cuda_source/` | Direct CUDA port: separate Haar DWT, IDWT and depthwise-conv kernels |
+| `cuda_opt` | `optimized_cuda_source/` | **Kernel fusion**: DWT and depthwise conv in one shared-memory tiled kernel, IDWT fused with the residual add, fused conv-backward and IDWT, parallel-reduction weight gradient |
+| `cuda_opt2` | `optimized2_cuda_source/` | `cuda_opt` plus a reworked backward pass and a tuned forward kernel (32x8 blocks for coalescing, weights cached in shared memory, unrolled loops for fixed K), with padding fixes for odd spatial sizes |
 
-```text
-DL_Project_WTConv/
-├── analysis/                 # Benchmarking and compilation scripts
-│   ├── benchmark_backward.py          # Run speed comparisons
-│   └── compile_utils.py      # JIT compilation utility
-├── cpp_source/               # C++ (CPU) Source Code
-├── cuda_source/              # Baseline CUDA Source Code
-├── optimized_cuda_source/    # Optimized (Fused) CUDA Source Code
-├── optimized2_cuda_source/   # Experimental "Pre-calc" CUDA Source Code
-├── Reference/                # Original PyTorch WTConv implementation
-├── tests/                    # PyTest suite for correctness verification
-├── experiment_results/       # Logs and plots from benchmarks
-├── experiment.py             # Main experiment runner
-├── inference.py              # Inference scripts
-├── model_surgery.py          # Utils to replace Conv2d with WTConv in models
-├── train.py                  # Training script
-├── requirements.txt          # Python dependencies
-└── README.md
+Also included:
+- **Model surgery** (`model_utils/model_surgery.py`): recursively swaps compatible `nn.Conv2d` layers (k > 1, `in == out` channels) in a torchvision model for any of the implementations above.
+- **Correctness tests** (`tests/`): forward outputs and autograd gradients are checked against the PyTorch reference.
+- **End-to-end benchmark suite** (`run_experiment_full.py`): trains and evaluates ResNet-18 for every implementation, wavelet level and seed, then aggregates the results into CSVs and plots.
+
+## Results
+
+ResNet-18 (10 classes) on Imagenette at 224x224, batch size 64, 6 epochs, mean over 3 seeds (10, 2, 367). The GPU is the run labelled `6000` in `old_runs/`. Source files are `full_analysis_output/inference_summary_by_level.csv` and `full_analysis_output/training_summary_by_level.csv`. Speedups are computed from those means.
+
+**Inference latency (ms / batch, lower is better)**
+
+| WT levels | Reference (PyTorch) | `cuda` | `cuda_opt` | `cuda_opt2` | Speedup (`cuda_opt` vs ref) |
+|---|---|---|---|---|---|
+| 1 | 25.48 | 6.26 | **4.81** | 4.87 | 5.3x |
+| 2 | 46.06 | 7.37 | **5.69** | 5.73 | 8.1x |
+| 3 | 68.14 | 8.51 | **6.35** | 6.43 | 10.7x |
+| 4 | 87.58 | 11.52 | **8.39** | 8.45 | 10.4x |
+
+**Training throughput (images / s, higher is better)**
+
+| WT levels | Reference (PyTorch) | `cuda` | `cuda_opt` | `cuda_opt2` | Speedup (`cuda_opt2` vs ref) |
+|---|---|---|---|---|---|
+| 1 | 1221.8 | 1347.6 | 1464.3 | **2061.1** | 1.69x |
+| 2 | 800.7 | 1115.7 | 1233.0 | **1741.9** | 2.18x |
+| 3 | 618.8 | 986.6 | 1099.0 | **1518.0** | 2.45x |
+| 4 | 509.1 | 794.7 | 880.8 | **1231.7** | 2.42x |
+
+Per-step timings tell the same story. At level 4 the forward pass takes 87.9 ms for the reference and 8.8 ms for `cuda_opt2`. At level 1, `cuda_opt2`'s backward pass takes 12.8 ms against 25.4 ms for the reference. The custom kernels use more VRAM than the reference, for example 4833 MB against 3186 MB at level 4.
+
+The reference's latency grows steeply with the number of wavelet levels, while the fused kernels grow much more slowly. Top-1 accuracy after 6 epochs is in the 64–75% range for every implementation (see the CSV for means and std).
+
+Plots (scalability, throughput, kernel breakdown, speedup heatmaps) are in `full_analysis_output/`. Earlier runs on RTX 3090 and RTX 4090 GPUs are in `old_runs/`.
+
+## Setup
+
+Requirements:
+- NVIDIA GPU with CUDA (compute capability 6.0+) and a matching CUDA toolkit
+- GCC (Linux) or MSVC (Windows) on the PATH
+- Python 3.10, PyTorch >= 2.0
+
+Install the dependencies:
+
+```bash
+conda create -n wt_conv python=3.10 && conda activate wt_conv
+pip install -r requirements.txt
 ```
 
-## 🛠️ Setup & Installation
+Build all extensions. This runs `setup.py build_ext --inplace` in each source directory:
 
-- **Prerequisites**
-
-    - **OS**: Windows or Linux
-
-    - **GPU**: NVIDIA GPU with CUDA support (Compute Capability 6.0+)
-
-    - **Compiler**: MSVC (Windows) or GCC (Linux) available in your system path.
-
-
-- **Environment Setup (Optional)(Recommended: Conda)**
-
-    ```Bash
-    # Create a new environment
-    conda create -n wt_conv python=3.10
-    conda activate wt_conv
-    ```
-
-- **Install Dependencies**
-
-    Install the required Python packages for testing, benchmarking, and building.
-
-    ```Bash
-    pip install -r requirements.txt
-    ```
-## ⚙️ Compilation
-
-This project uses a custom JIT (Just-In-Time) compilation script to build the C++ and CUDA extensions.
-
-Run the compilation utility:
-
-```Bash
+```bash
 python analysis/compile_utils.py
 ```
 
-- If successful, you will see `✅ SUCCESS` messages for `cpp_source`, `cuda_source`, `optimized_cuda_source` and `optimized2_cuda_source`.
+You should see `SUCCESS` for `cpp_source`, `cuda_source`, `optimized_cuda_source` and `optimized2_cuda_source`.
 
-- **Windows Note**: If you encounter an "Access Denied" error, ensure no Python processes (like a running Jupyter kernel or `pytest`) are locking the `.pyd` files. Close them and try again.
+> **Windows:** if the build fails with "Access Denied", close any Python process (Jupyter, pytest) that still holds the `.pyd` files.
 
-## Running Tests
+## Usage
 
-We use `pytest` to ensure that the custom C++ and CUDA implementations produce identical outputs and identical gradients to the PyTorch reference.
+**Correctness tests.** These check outputs and gradients against PyTorch autograd:
 
-```Bash
+```bash
 pytest tests/
 ```
-Test Breakdown:
 
-- `test_cpp.py`: Validates the C++ (CPU) Forward and Backward logic.
+**Layer micro-benchmark** (forward and backward, all implementations):
 
-- `test_cuda.py`: Validates the Baseline CUDA implementation.
+```bash
+python analysis/benchmark_backward.py --batch 32 --channels 128 --kernel 5 --iters 100
+```
 
-- `test_opts.py`: Validates the Optimized CUDA implementations (1 and 2) against PyTorch Autograd.
+Flags: `--batch` (16), `--channels` (64), `--height`/`--width` (64), `--kernel` (5), `--levels` (1), `--iters` (50), `--warmup` (30), `--no-build`.
 
-## 📊 Benchmarking & Analysis
+**Full end-to-end experiment** (train, then inference, then analysis):
 
-To analyze the performance improvements, run the benchmark script `analysis/benchmark_backward.py`. This script automatically compiles the extensions (unless skipped) and compares the runtime of the Forward and Backward passes across all implementations.
+```bash
+# Reproduce the reported results
+python run_experiment_full.py --epochs 6 --seeds 10 2 367 --levels 1 2 3 4
 
-- **Basic usage:**
+# Quick sanity check
+python run_experiment_full.py --epochs 1 --levels 1 --impls cuda_opt2
+```
 
-    ```Bash
-    python analysis/benchmark_backward.py
-    ```
+Other flags: `--batch-size` (64), `--model` (`resnet18` | `resnet50`), `--impls`, `--device`, `--skip-train`, `--skip-inference`, `--no-cleanup` (keep `.pth` checkpoints), `--no-report-clean`.
 
-- **Customizing the Benchmark**
+> **Note:** by default the suite **wipes** `training_reports/`, `inference_reports/` and `full_analysis_output/` before it starts. Pass `--no-report-clean` to keep the existing results.
 
-    You can customize the input dimensions, batch size, and kernel parameters using CLI flags:
+Outputs:
+- `full_analysis_output/training_summary_by_level.csv`: throughput, VRAM, forward and backward ms
+- `full_analysis_output/inference_summary_by_level.csv`: latency, throughput, accuracy
+- `full_analysis_output/*.png`: plots
 
-    ```Bash
-    python analysis/benchmark_backward.py --batch 32 --channels 128 --kernel 5 --iters 100
-    ```
+## Repository layout
 
-    **Available Flags:**
+```text
+├── cpp_source/               C++ / OpenMP CPU extension
+├── cuda_source/              Baseline CUDA extension
+├── optimized_cuda_source/    Fused CUDA extension (cuda_opt)
+├── optimized2_cuda_source/   Fused CUDA extension with optimized fwd/bwd (cuda_opt2)
+├── Reference/                Original PyTorch WTConv (BGU-CS-VIL/WTConv, MIT)
+├── model_utils/              Conv2d -> WTConv model surgery
+├── full_model_tests/         ResNet training / inference / analysis scripts
+├── analysis/                 Build utility, layer benchmarks, profiling
+├── tests/                    pytest correctness suite
+├── run_experiment_full.py    End-to-end experiment driver
+├── analyze_full_results.py   Aggregates reports into CSVs and plots
+├── training_reports/         Per-run training JSON (latest run)
+├── inference_reports/        Inference benchmark JSON/TXT (latest run)
+├── full_analysis_output/     Aggregated CSVs and plots (latest run)
+└── old_runs/                 Earlier runs (RTX 3090, RTX 4090, sanity check)
+```
 
+## Authors
 
-    | Flag        | Default | Description                                                     |
-    |-------------|---------|-----------------------------------------------------------------|
-    | `--batch`   | 16      | Batch size (N)                                                  |
-    | `--channels`| 64      | Input channels (C)                                              |
-    | `--height`  | 64      | Input height (H)                                                |
-    | `--width`   | 64      | Input width (W)                                                 |
-    | `--kernel`  | 5       | Convolution kernel size (K)                                     |
-    | `--levels`  | 1       | Wavelet decomposition levels                                    |
-    | `--iters`   | 50      | Number of benchmark iterations for timing average               |
-    | `--warmup`  | 30      | Number of warmup iterations before timing                       |
-    | `--no-build`| False   | Skip auto-compilation step (useful if already compiled)         |
+- **Dayan** ([@Dayan135](https://github.com/Dayan135)): project lead. Wrote the C++ and CUDA implementations, the fused `cuda_opt` kernels including the optimized backward pass, multi-level support, the auto-compilation tooling and the pytest suite.
+- **Tal** ([@Talmal6](https://github.com/Talmal6)): wrote the CUDA backpropagation and the backward benchmark, rewrote the `cuda_opt2` forward and backward kernels, fixed the odd-dimension padding and added the correctness tests.
+- **Omer Aviram** ([@aviramom](https://github.com/aviramom)): built the evaluation side: model surgery, the ResNet training and inference pipelines on Imagenette, the end-to-end experiment suite (`run_experiment_full.py`), the results analysis and plots, and the multi-GPU benchmark runs.
 
+## Acknowledgements
 
-## Reproducing Experiments
-We provide a fully automated experiment suite run_experiment_full.py that handles training, inference benchmarking, cleanup, and data analysis in a single step.
-
-- **Run the Full Suite (Paper Reproduction)**
-To replicate the exact experiments reported in our work (Training ResNet18 for 6 epochs on 3 different seeds, across all wavelet levels), run:
-   ```Bash
-    python run_experiment_full.py --epochs 6 --seeds 10 2 367 --levels 1 2 3 4
-    ```
-
-
-This script will automatically:
-
-   - Train the model using 4 different implementations (reference, cuda, cuda_opt, cuda_opt2) across all specified levels and seeds.
-     
-   - Benchmark Inference on the trained checkpoints to measure latency and throughput.
-     
-   - Clean Up heavy checkpoint files to save disk space (optional).
-     
-   - Analyze Results and generate the plots and tables found in `--full_analysis_output/`
-
-- **Custom Experiments:**
-   You can customize the benchmark using CLI flags.
-
-   - Example: Quick Sanity Check (1 Epoch, Level 1 only):
-       ```Bash
-          python run_experiment_full.py --epochs 1 --levels 1 --impls cuda_opt2
-       ```
-
- | Flag               | Default  | Description                                                     |
- |--------------------|----------|-----------------------------------------------------------------|
- | `--epochs`         | 6        | Number of training epochs per run.                              |
- | `--batch-size`     | 64       | Batch size for training and inference.                          |
- | `--model`          | resnet18 | Model architecture to use (resnet18 or resnet50).               |
- | `--seeds`          | 10 2 367 | Space-separated list of random seeds for multiple runs.         |
- | `--levels`         | 1 2 3 4  | Space-separated list of Wavelet decomposition levels to test.   |
- | `--impls`          | all      | Specific implementations to run (e.g. cuda_opt2).               |
- | `--device`         | cuda     | Compute device (cuda or cpu).                                   |
- | `--skip-train`     | False    | Skip the training phase (useful for re-running inference).      |
- | `--skip-inference` | False    | Skip the inference benchmark phase.                             |
- | `--no-cleanup`     | False    | Keep .pth checkpoints after the run (Uses disk space).          |
- | `--no-report-clean`| False    | Do not delete old report folders before starting.               |
-
-
-- **Output Data**
-   - After the run completes, check the `--full_analysis_output/` directory for:
-   
-   - training_summary_by_level.csv: Detailed training metrics (Forward/Backward ms, VRAM).
-   
-   - inference_summary_by_level.csv: Inference latency and accuracy stats.
-   
-   - *.png: Visualizations including the Scalability Chart, Speedup Heatmap, and Kernel Breakdown.
-
-
-
-
-
-
+Built on [BGU-CS-VIL/WTConv](https://github.com/BGU-CS-VIL/WTConv) by Shahaf E. Finder, Roy Amoyal, Eran Treister and Oren Freifeld (MIT License).
